@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from uiprotect.data import Event, EventType, ModelType, SmartDetectObjectType, WSAction, WSSubscriptionMessage
@@ -413,6 +413,76 @@ class EventManager:
             result["is_favorite"] = event.is_favorite
         return result
 
+    def _raw_event_to_dict(
+        self,
+        raw: dict[str, Any],
+        *,
+        compact: bool = False,
+        metadata_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Convert a RAW UniFi event dict (as returned by api_request_list) to the
+        same response shape as _event_to_dict.
+
+        Unlike _event_to_dict (which takes a parsed uiprotect.Event), this path
+        preserves every field UniFi returned — including fields uiprotect strips
+        during parsing (linesStatus, zonesStatus, weather, etc.). Opt in to that
+        extra data via `metadata_fields`.
+        """
+        camera_id = _get(raw, "camera") or _get(raw, "camera_id")
+        type_value = _get(raw, "type")
+        # raw start/end are epoch milliseconds; normalize to ISO strings to match
+        # the existing _event_to_dict response shape.
+        start_ms = _get(raw, "start")
+        end_ms = _get(raw, "end")
+        start_iso = (
+            datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
+            if isinstance(start_ms, (int, float))
+            else None
+        )
+        end_iso = (
+            datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat()
+            if isinstance(end_ms, (int, float))
+            else None
+        )
+        sdt = _get(raw, "smartDetectTypes") or _get(raw, "smart_detect_types") or []
+        if not isinstance(sdt, list):
+            sdt = []
+
+        result: dict[str, Any] = {
+            "id": _get(raw, "id"),
+            "type": type_value,
+            "camera_id": camera_id,
+            "camera_name": self._resolve_camera_name(camera_id),
+            "start": start_iso,
+            "end": end_iso,
+            "score": _get(raw, "score"),
+            "smart_detect_types": sdt,
+        }
+        # Existing face convenience extractor (relies on _get/_get_any which
+        # handle both Event objects and dicts) keeps working untouched.
+        # Note: PR-4 introduces _license_plate_recognition_fields on a separate
+        # branch. This PR does not depend on PR-4; when both merge an integration
+        # commit will add the parallel call here.
+        result.update(self._face_recognition_fields(raw))
+
+        if not compact:
+            result["thumbnail_id"] = _get(raw, "thumbnail") or _get(raw, "thumbnail_id")
+            result["category"] = _get(raw, "category")
+            result["sub_category"] = _get(raw, "subCategory") or _get(raw, "sub_category")
+            result["is_favorite"] = _get(raw, "isFavorite") or _get(raw, "is_favorite")
+
+        if metadata_fields:
+            raw_md = _get(raw, "metadata") or {}
+            if "*" in metadata_fields:
+                if raw_md:
+                    result["metadata"] = raw_md
+            else:
+                filtered = {k: raw_md[k] for k in metadata_fields if k in raw_md}
+                if filtered:
+                    result["metadata"] = filtered
+
+        return result
+
     # ------------------------------------------------------------------
     # Buffer access
     # ------------------------------------------------------------------
@@ -461,25 +531,53 @@ class EventManager:
         camera_id: str | None = None,
         limit: int = 30,
         compact: bool = False,
+        metadata_fields: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Query events from the NVR via the REST API.
 
-        Wraps ``ProtectApiClient.get_events`` with convenient filtering.
+        When camera_id or metadata_fields is set, bypasses uiprotect's
+        get_events() (which has no camera filter and drops several metadata
+        fields) and calls UniFi's events endpoint directly. Otherwise
+        delegates to the existing uiprotect path for full backwards
+        compatibility.
         """
-        kwargs: dict[str, Any] = {"limit": limit, "sorting": "desc"}
+        use_raw_path = bool(camera_id) or bool(metadata_fields)
 
+        if use_raw_path:
+            params: dict[str, Any] = {
+                "orderDirection": "DESC",
+                "limit": limit,
+                "withoutDescriptions": "true",
+            }
+            if start is not None:
+                params["start"] = int(start.timestamp() * 1000)
+            if end is not None:
+                params["end"] = int(end.timestamp() * 1000)
+            if event_type:
+                params["types"] = [event_type]
+            if camera_id:
+                params["cameras"] = [camera_id]
+
+            raw_events = await self._cm.client.api_request_list("events", params=params)
+
+            results: list[dict[str, Any]] = []
+            for raw in raw_events:
+                results.append(self._raw_event_to_dict(raw, compact=compact, metadata_fields=metadata_fields))
+            await self._apply_known_face_names(results)
+            return results
+
+        # ----- existing uiprotect path (unchanged) -----
+        kwargs: dict[str, Any] = {"limit": limit, "sorting": "desc"}
         if start:
             kwargs["start"] = start
         if end:
             kwargs["end"] = end
 
-        # Map string event type to EventType enum
         types_filter: list[EventType] | None = None
         if event_type:
             try:
                 types_filter = [EventType(event_type)]
             except ValueError:
-                # Try matching by enum name (case-insensitive)
                 for et in EventType:
                     if et.name.lower() == event_type.lower():
                         types_filter = [et]
@@ -491,7 +589,7 @@ class EventManager:
 
         events: list[Event] = await self._cm.client.get_events(**kwargs)
 
-        results: list[dict[str, Any]] = []
+        results = []
         for ev in events:
             if camera_id and ev.camera_id != camera_id:
                 continue
@@ -500,11 +598,29 @@ class EventManager:
         await self._apply_known_face_names(results)
         return results
 
-    async def get_event(self, event_id: str) -> dict[str, Any]:
+    async def get_event(
+        self,
+        event_id: str,
+        metadata_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Get a single event by ID.
+
+        When ``metadata_fields`` is non-empty, bypasses uiprotect's Event
+        parsing and calls UniFi's ``events/<id>`` endpoint directly to
+        preserve the full metadata payload (filtered to caller-requested
+        top-level keys).
 
         Raises ``ValueError`` if the event is not found.
         """
+        if metadata_fields:
+            try:
+                raw = await self._cm.client.api_request_obj(f"events/{event_id}")
+            except Exception as exc:
+                raise UniFiNotFoundError("event", event_id) from exc
+            result = self._raw_event_to_dict(raw, metadata_fields=metadata_fields)
+            await self._apply_known_face_names([result])
+            return result
+
         try:
             event: Event = await self._cm.client.get_event(event_id)
         except Exception as exc:
@@ -581,14 +697,48 @@ class EventManager:
         min_confidence: int | None = None,
         limit: int = 30,
         compact: bool = False,
+        metadata_fields: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """List smart detection events with optional filtering.
 
         Queries for ``smartDetectZone`` and ``smartDetectLine`` event types,
         then filters by detection type and confidence score.
+
+        When camera_id or metadata_fields is set, bypasses uiprotect's
+        get_events() and calls UniFi's events endpoint directly (same raw-API
+        path as list_events) so that metadata fields are preserved.
         """
         min_conf = min_confidence if min_confidence is not None else self._min_confidence
+        use_raw_path = bool(camera_id) or bool(metadata_fields)
 
+        if use_raw_path:
+            params: dict[str, Any] = {
+                "orderDirection": "DESC",
+                "limit": limit,
+                "withoutDescriptions": "true",
+                "types": ["smartDetectZone", "smartDetectLine"],
+            }
+            if start is not None:
+                params["start"] = int(start.timestamp() * 1000)
+            if end is not None:
+                params["end"] = int(end.timestamp() * 1000)
+            if camera_id:
+                params["cameras"] = [camera_id]
+            if detection_type:
+                params["smartDetectTypes"] = [detection_type]
+
+            raw_events = await self._cm.client.api_request_list("events", params=params)
+
+            results: list[dict[str, Any]] = []
+            for raw in raw_events:
+                score = raw.get("score", 100) or 0
+                if score < min_conf:
+                    continue
+                results.append(self._raw_event_to_dict(raw, compact=compact, metadata_fields=metadata_fields))
+            await self._apply_known_face_names(results)
+            return results
+
+        # ----- existing uiprotect path (unchanged) -----
         kwargs: dict[str, Any] = {
             "limit": limit,
             "sorting": "desc",
@@ -614,16 +764,16 @@ class EventManager:
 
         events: list[Event] = await self._cm.client.get_events(**kwargs)
 
-        results: list[dict[str, Any]] = []
+        uiprotect_results: list[dict[str, Any]] = []
         for ev in events:
             if camera_id and ev.camera_id != camera_id:
                 continue
             if ev.score < min_conf:
                 continue
-            results.append(self._event_to_dict(ev, compact=compact))
+            uiprotect_results.append(self._event_to_dict(ev, compact=compact))
 
-        await self._apply_known_face_names(results)
-        return results
+        await self._apply_known_face_names(uiprotect_results)
+        return uiprotect_results
 
     async def acknowledge_event(self, event_id: str) -> dict[str, Any]:
         """Mark an event as acknowledged/favorite on the NVR.
