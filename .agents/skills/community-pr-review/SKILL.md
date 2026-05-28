@@ -147,7 +147,7 @@ review comment (first-time contributors).
 Scan for f-string logger calls:
 
 ```bash
-grep -rn 'logger\\.\\\\(debug\\\\|info\\\\|warning\\\\|error\\\\|critical\\\\)(f\"' $(git diff --name-only origin/main...HEAD)
+grep -rn 'logger\\\\.\\\\\\\\(debug\\\\\\\\|info\\\\\\\\|warning\\\\\\\\|error\\\\\\\\|critical\\\\\\\\)(f\\\"' $(git diff --name-only origin/main...HEAD)
 ```
 
 Replace any hits with `%s`-style lazy formatting:
@@ -166,7 +166,7 @@ keep appearing. In PR #119, level99's tool layer used `%s` correctly but introdu
 calls in `device_manager.py` (14), `network_manager.py` (7), and `tools/network.py` (2). Always
 check manager files explicitly.
 
-**Implicit concatenation is invisible to grep:** Adjacent string literals (`\"foo\" \"bar\"`) cannot
+**Implicit concatenation is invisible to grep:** Adjacent string literals (`\\\"foo\\\" \\\"bar\\\"`) cannot
 be reliably caught by automated scripts. This survived a 481-call automated migration in PR #122
 and was only caught by manual review. Scan manually for this pattern when logger calls span lines.
 
@@ -231,7 +231,7 @@ class FirewallPolicyBase(BaseModel):
     schedule: dict = {"mode": "ALWAYS"}  # silently overwrites on update
 ```
 
-With this model, `update_firewall_policy({\"name\": \"new\"})` would silently inject unwanted field
+With this model, `update_firewall_policy({\\\"name\\\": \\\"new\\\"})` would silently inject unwanted field
 values — overwriting whatever the controller currently has, regardless of what the caller specified.
 
 **The rule:** Non-`None` defaults belong only in create-specific subclasses or create-specific
@@ -279,6 +279,45 @@ the scope of the damage.
 differ between controller versions, and some fields only appear when specific configuration exists.
 A test that passes against a mock may fail silently against a real controller.
 
+**Gotcha:** HA/shadow mode transient failures are environment issues, not code bugs. If live smoke tests fail with errors like "resource temporarily unavailable" or "sync in progress," verify that the HA cluster has stabilized (check controller logs). Retry the smoke test after 30–60 seconds. This failure mode is transient and does not indicate a problem with the PR code. Do not block merge on HA transient failures; document them in the PR and retry post-merge if necessary.
+
+### API Family Boundary Check (V2 vs. Integration)
+
+**Target:** Any PR that adds or modifies tools that expose UniFi API identifiers (resource IDs, object references).
+
+The UniFi API consists of two distinct identifier families: **V2 ObjectIDs** (UUID format, used by newer controllers and network/protect APIs) and **Integration UUIDs** (legacy format, used by older systems and specific handlers). Tools must not mix identifier families in the same resource surface — doing so creates silent data-loss bugs when downstream integrations receive mismatched ID types.
+
+**Family boundary rule:** Each tool's input and output surfaces must be consistently rooted in a single identifier family. If a tool exposes a resource's primary ID in V2 ObjectID format, all nested references (e.g., device IDs, policy IDs) must also be V2 ObjectIDs. If rooted in Integration UUID format, all nested references must be Integration UUIDs.
+
+**Validation checklist:**
+
+1. **Identify the tool's primary ID family** — Check what type of ID the tool returns for its primary resource (e.g., if `unifi_get_firewall_policy` returns a policy with ID `"uuid-1234"`, confirm whether that's a V2 ObjectID or Integration UUID)
+2. **Audit nested object references** — Scan all nested objects returned by the tool (e.g., device references, site references, user references) and confirm their ID types match the primary family
+3. **Check create/update input surfaces** — For tools that accept resource IDs as input (e.g., `device_id` in an update tool), verify they accept the same ID family as the primary resource
+4. **Cross-tool consistency** — If multiple tools operate on the same resource type, ensure all of them use the same ID family across read, list, create, and update surfaces
+
+**Example pass:**
+```python
+# CORRECT — consistent V2 ObjectID family
+def unifi_get_firewall_policy(policy_id: str) -> dict:  # V2 ObjectID
+    return {
+        "id": "abc-123",  # V2 ObjectID
+        "device_ids": ["def-456", "ghi-789"],  # V2 ObjectIDs
+    }
+```
+
+**Example fail:**
+```python
+# BLOCKED — mixed identifier families
+def unifi_get_firewall_policy(policy_id: str) -> dict:
+    return {
+        "id": "abc-123",  # V2 ObjectID
+        "device_ids": ["legacy-uuid-1", "legacy-uuid-2"],  # Integration UUIDs — MISMATCH
+    }
+```
+
+If the PR introduces mixed families, request fixes before merge. This is a **hard blocker**.
+
 ### Mutating Cycle Tests (Create/Update/Delete PRs)
 
 For any PR that touches create, update, or delete handlers, run a full mutating cycle using
@@ -300,6 +339,117 @@ accidentally zero out existing configuration. The verify step is the only reliab
 [UPDATE] set description="updated", name unchanged → read back: name="test-smoke-policy" ✓
 [DELETE] abc123 → 204 No Content ✓
 ```
+
+### New-Parameter Coverage (Read-Tool PRs that Add Optional Params)
+
+`scripts/live_smoke.py` auto-discovers required arguments and calls every tool
+with **default values only**. For PRs that add new optional parameters with
+non-trivial code paths (filters, shape selectors, projection flags, summary
+toggles), the default-only sweep confirms no regression in the unparameterized
+path but exercises **none** of the new code. A targeted second pass is
+required.
+
+**Procedure:**
+
+1. **Default-only sweep first** — `live_smoke.py --server <server> --phase safe`.
+   This is the regression detector for existing behavior; it is not a validator
+   of new behavior. A passing sweep means "the default path didn't break,"
+   not "the new parameters work."
+
+2. **Targeted in-process pass** — build a small Python script under `scripts/`
+   that imports the tool functions directly, calls each with at least one
+   representative non-default combo per new parameter, and asserts on the
+   response shape. Cover:
+   - Each new param invoked with a non-default value
+   - Echo/diagnostic surfaces (e.g., unknown-token echoes)
+   - Filter composition when multiple new filters can combine
+   - Shape inversion (e.g., `summary=True` vs `summary=False` on the same
+     tool returning different keys)
+
+3. **Delete the script after verification.** It's one-shot validation, not a
+   durable harness — keeping it adds ambient maintenance load without
+   proportional value (per [[feedback_scripts_perceived_rigor]]).
+
+The harness's silence on a new parameter is not evidence of correctness; it
+is evidence of no test.
+
+### Docker Compose Verification (Shape/Description/Default Changes)
+
+For PRs that change tool descriptions, response shapes, parameter defaults, or
+parameter schemas, an in-process script is insufficient. The MCP serialization
+layer, the schema surface visible to MCP clients, and the lazy-discovery
+description text are separate verification surfaces that only the containerized
+server exercises end-to-end.
+
+**Bring the container up:**
+
+```bash
+docker compose -f docker/docker-compose.yml up -d --build unifi-network-mcp
+```
+
+Wait for readiness:
+
+```bash
+until curl -sf -o /dev/null \
+    -X POST -H 'Content-Type: application/json' \
+    -H 'Accept: application/json,text/event-stream' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke","version":"0"},"capabilities":{}}}' \
+    http://localhost:3000/mcp; do sleep 2; done
+```
+
+Then connect via the streamable-http MCP client and verify **both** discovery
+paths a real LLM client uses:
+
+**1. Pre-loaded path (`unifi_load_tools` then `list_tools`)** — confirms the
+full JSON schema reaches MCP clients: parameter names, types, defaults,
+descriptions. Verify each new param appears in `inputSchema.properties` with
+the correct default.
+
+**2. Default lazy-execute path (`unifi_execute(tool, arguments)`)** — this is
+how most MCP clients call tools by default (no pre-load). Verify:
+   - `unifi_tool_index` returns descriptions that carry the new param
+     semantics in the **description text**. The tool index is
+     `{name, title, description}` only — full JSON schemas do not appear at
+     the lazy-discovery tier. Any new parameter the LLM needs to know about
+     must be mentioned in the description prose; a schema-only update is
+     invisible to lazy-tier callers.
+   - `unifi_execute(tool="...", arguments={...})` passes the new params
+     through the dispatcher and returns the same response shape as the
+     pre-loaded path.
+   - `unifi_execute` **auto-promotes** the called tool into the loaded set —
+     "lazy" means deferred-until-first-use, not ephemeral. After one
+     `unifi_execute` call, the tool appears in `list_tools` for the rest of
+     the session.
+
+Tear down the container after verification:
+
+```bash
+docker compose -f docker/docker-compose.yml down unifi-network-mcp
+```
+
+### "Fully Additive" Claim Audit
+
+When a PR body claims "fully additive" or "all new parameters are optional and
+default to existing behavior", trust but verify by diffing every response shape
+against `main`.
+
+**Procedure:** For each list/detail tool the PR touches, read the `origin/main`
+version of the tool and compare the **literal response dict keys** in the
+default-parameter path against the PR version. Any field that disappears from
+the default path is a breaking change, even if the PR adds an opt-in flag to
+restore it via a non-default parameter.
+
+The remediation options for any such finding:
+
+- **(a)** Gate the narrowing behind an opt-in flag where the default preserves
+  the legacy shape (e.g., `summary=True` defaults to compressed, `summary=False`
+  returns the full pre-PR payload).
+- **(b)** Explicitly call out the narrowing in the PR body as an intentional
+  breaking change, and verify the response-key delta is documented for
+  downstream consumers.
+
+A claim of "fully additive" with a quietly-narrowed default path is not
+acceptable — either gate it or document it.
 
 ---
 
@@ -350,7 +500,7 @@ When you find merge blockers in Step 1, submit your GitHub review as **`request-
 as `comment`. This matters for two reasons:
 
 1. **Prevents accidental merge** — GitHub blocks merging a PR that has an unresolved
-   \"request changes\" review, even if CI is green.
+   \\\"request changes\\\" review, even if CI is green.
 2. **Signals mandatory work clearly** — the contributor sees their PR requires action, not just
    feedback.
 
@@ -384,11 +534,11 @@ git fetch <contributor>
 git checkout -b review/<pr-branch> <contributor>/<pr-branch>
 
 # Make your fixes, then commit with attribution context
-git commit -m \"fix: address review gaps from PR #NNN
+git commit -m \\\"fix: address review gaps from PR #NNN
 
 - Replace f-string loggers in device_manager.py (14 instances)
 - Register new validator in registry
-Co-authored-by: Contributor Name <email>\"
+Co-authored-by: Contributor Name <email>\\\"
 
 # Push back to their fork
 git push <contributor> HEAD:<pr-branch>
@@ -419,7 +569,7 @@ When a first-time or low-history contributor is **historically unresponsive** (n
 
 **The fork-edit model only works for personal forks.** Org forks (e.g., `vigrai/unifi-mcp`
 from contributor fgallese in PR #133) block `git push` back to the contributor's branch even
-when \"Allow edits from maintainers\" is checked on the PR. That checkbox is scoped to personal
+when \\\"Allow edits from maintainers\\\" is checked on the PR. That checkbox is scoped to personal
 accounts — GitHub does not honor it for org-owned forks.
 
 Decision matrix:
@@ -459,7 +609,7 @@ For PRs that modify tools or API handlers, the PR description must include:
 ```
 
 **2. Embedded live test output** — Paste the raw terminal output (not a prose summary). Reviewers
-need actual values and shapes, not \"tests passed.\"
+need actual values and shapes, not \\\"tests passed.\\\"
 
 ```markdown
 <details>
@@ -472,7 +622,7 @@ need actual values and shapes, not \"tests passed.\"
 </details>
 ```
 
-Reviewers have been burned by \"all tests passed\" summaries that omit the one tool that returned a
+Reviewers have been burned by \\\"all tests passed\\\" summaries that omit the one tool that returned a
 malformed response. Embed the raw output and let the reviewer decide what matters.
 
 **3. Issue references** — Tag every issue using `#N` format. GitHub autolinks and auto-closes on merge:
@@ -568,6 +718,8 @@ using this exact approach and a fix PR was opened the same session.
 | Pydantic model wiring (Gate 2) | Critical (silent) | `unifi-core/models/<domain>.py` + tool `to_controller_update` call | Domain model exists but tool bypasses it with raw dict |
 | Doc site count (Gate 3) | Ordering gate | Doc site entry count | Updated after merge instead of before |
 | Shared pydantic model defaults (Gate 4) | Hard block | `<Domain>Base` model in `unifi-core` | Non-None defaults on shared base model fields silently overwrite update-tool fields |
+| API family boundary (Step 1.5) | Hard block | Tool ID types and nested object references | V2 ObjectID and Integration UUID mixed in same tool surface |
+| HA/shadow mode transience (Step 1.5) | Environment issue (not code) | Live smoke test error messages | Blocking merge on HA sync timeouts; retry after stabilization |
 | AI-Bot vs human (Step 1.5b) | Precedent gate | Issue tracker + PR scope | Merging bot PRs with parallel in-house work; missing credit for human contributors |
 | Live smoke tests (Step 1.5) | Validation requirement | `scripts/live_smoke.py` output | Approval without actual live controller tests; mock-only validation |
 | Mutation cycles (Step 1.5) | Field preservation blocker | Create → update → verify → delete cycle | Update tools that reconstruct objects silently zero fields |
