@@ -433,14 +433,15 @@ async def _fetch_alarm_rules(ctx: GraphQLContext, controller: str) -> Any:
                 session,
                 controller,
                 "protect",
-                "alarm_manager",
+                "alarm_facade",
             )
             await ctx.manager_factory.get_connection_manager(
                 session,
                 controller,
                 "protect",
             )
-            return await mgr.list_rules()
+            rules, _complete = await mgr.list_rules()
+            return rules
 
     return await ctx.cache.get_or_fetch(key, _do)
 
@@ -454,14 +455,15 @@ async def _fetch_alarm_rule(ctx: GraphQLContext, controller: str, rule_id: str) 
                 session,
                 controller,
                 "protect",
-                "alarm_manager",
+                "alarm_facade",
             )
             await ctx.manager_factory.get_connection_manager(
                 session,
                 controller,
                 "protect",
             )
-            return await mgr.get_rule(rule_id)
+            rule, _complete = await mgr.get_rule(rule_id)
+            return rule
 
     return await ctx.cache.get_or_fetch(key, _do)
 

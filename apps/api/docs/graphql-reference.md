@@ -190,20 +190,17 @@ type AlarmProfileList {
   count: Int
 }
 
-"""
-A UniFi Protect alarm rule (Alarm Manager automation) — flat passthrough.
-"""
+"""A UniFi Protect alarm rule (normalized; includes AI-powered alarms)."""
 type AlarmRule {
   id: ID
-  name: String
-  enable: Boolean
-  isCreatedBySystem: Boolean
-  sources: JSON
-  conditions: JSON
-  historyConditions: JSON
-  schedules: JSON
+  title: String
+  enabled: Boolean
+  triggers: JSON
   actions: JSON
-  cooldown: JSON
+  scope: JSON
+  stats: JSON
+  createdAt: String
+  updatedAt: String
 }
 
 """Wrapper for protect_alarm_list_rules — {rules, count}."""

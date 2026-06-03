@@ -32,6 +32,7 @@ from unifi_mcp_shared.strict_dispatch import StrictKwargFastMCP
 from unifi_protect_mcp.bootstrap import load_config, logger
 
 _TOOLS_MANIFEST_PATH = Path(__file__).resolve().parent / "tools_manifest.json"
+from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
 from unifi_core.protect.managers.alarm_manager import AlarmManager
 from unifi_core.protect.managers.camera_manager import CameraManager
 from unifi_core.protect.managers.chime_manager import ChimeManager
@@ -217,6 +218,11 @@ def get_alarm_manager() -> AlarmManager:
 
 
 @lru_cache
+def get_alarm_facade() -> AlarmRulesFacade:
+    return AlarmRulesFacade.from_connection(get_connection_manager())
+
+
+@lru_cache
 def get_tool_registry() -> dict[str, Any]:
     """Return the global tool registry for runtime access."""
     return TOOL_REGISTRY
@@ -243,6 +249,7 @@ liveview_manager = get_liveview_manager()
 recognition_manager = get_recognition_manager()
 system_manager = get_system_manager()
 alarm_manager = get_alarm_manager()
+alarm_facade = get_alarm_facade()
 tool_registry = get_tool_registry()
 
 logger.debug("runtime.py: shared singletons initialised")

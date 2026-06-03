@@ -96,6 +96,7 @@ def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
 
 
 def _build_protect_managers() -> dict[str, Callable[[Any], Any]]:
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
     from unifi_core.protect.managers.alarm_manager import AlarmManager
     from unifi_core.protect.managers.camera_manager import CameraManager
     from unifi_core.protect.managers.chime_manager import ChimeManager
@@ -109,6 +110,7 @@ def _build_protect_managers() -> dict[str, Callable[[Any], Any]]:
 
     return {
         "alarm_manager": lambda cm: AlarmManager(cm),
+        "alarm_facade": lambda cm: AlarmRulesFacade.from_connection(cm),
         "camera_manager": lambda cm: CameraManager(cm),
         "chime_manager": lambda cm: ChimeManager(cm),
         "event_manager": lambda cm: EventManager(cm),

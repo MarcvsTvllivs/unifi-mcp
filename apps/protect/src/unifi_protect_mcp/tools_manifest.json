@@ -550,13 +550,13 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Fetches the full payload of a single alarm rule (automation) by id. Use the returned dict as the basis for protect_alarm_update_rule's body parameter \u2014 Protect requires the full rule body on PATCH.",
+      "description": "Fetches a single UniFi Protect alarm rule by id (normalized: id, title, enabled, triggers, actions, scope, stats), including AI-powered alarms.",
       "name": "protect_alarm_get_rule",
       "schema": {
         "input": {
           "properties": {
             "rule_id": {
-              "description": "Alarm rule (automation) UUID from protect_alarm_list_rules",
+              "description": "Alarm rule id from protect_alarm_list_rules",
               "type": "string"
             }
           },
@@ -810,7 +810,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Lists every alarm rule (automation) configured in the UniFi Protect Alarm Manager. Each rule includes id, name, enable flag, sources (camera scope), conditions (AND-list of triggers like license_plate_known or smartDetectLine), actions (webhook URLs, etc.), and cooldown. Use protect_alarm_get_rule for the full payload of a single rule needed for the read-modify-write update flow.",
+      "description": "Lists every UniFi Protect alarm rule, including AI-powered alarms (e.g. AI Natural Language). Each rule is normalized to id, title, enabled, triggers, actions, scope, and stats. Use protect_alarm_get_rule for a single rule.",
       "name": "protect_alarm_list_rules",
       "schema": {
         "input": {
@@ -896,29 +896,29 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Updates an alarm rule via PATCH. Protect requires the FULL rule body \u2014 partial PATCH bodies are rejected by the controller. The expected flow is: (1) call protect_alarm_get_rule to fetch the current rule, (2) mutate the returned dict in-place, (3) pass the mutated dict back here as body. Body keys may be snake_case (as returned by get_rule) or camelCase; the tool normalizes to camelCase before PATCHing. ``actions`` must be a non-empty list. Requires confirm=True to apply \u2014 otherwise returns a preview of current vs proposed.",
+      "description": "Updates an alarm rule. Pass only the fields you want to change; the tool fetches the current rule, deep-merges your changes, and PATCHes the full body (Protect rejects partial bodies \u2014 fetch-merge-put is handled for you). Field keys may be snake_case or camelCase. Requires confirm=True to apply \u2014 otherwise returns a preview of the proposed changes.",
       "name": "protect_alarm_update_rule",
       "permission_action": "update",
       "permission_category": "alarm",
       "schema": {
         "input": {
           "properties": {
-            "body": {
-              "description": "Full rule payload. Get the current rule via protect_alarm_get_rule, mutate, then pass here.",
-              "type": "object"
-            },
             "confirm": {
               "description": "When true, applies the update. When false (default), returns a preview.",
               "type": "boolean"
             },
+            "fields": {
+              "description": "Partial set of rule fields to change (e.g. name, enable, actions). Merged into the current rule.",
+              "type": "object"
+            },
             "rule_id": {
-              "description": "Alarm rule (automation) UUID to update",
+              "description": "Alarm rule id to update",
               "type": "string"
             }
           },
           "required": [
             "rule_id",
-            "body"
+            "fields"
           ],
           "type": "object"
         },
