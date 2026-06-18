@@ -26,9 +26,11 @@ from unifi_core.protect.models.cameras import (
 from unifi_core.protect.models.cameras import (
     to_controller_update as camera_to_controller_update,
 )
-from unifi_protect_mcp.runtime import camera_manager, server
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_protect_mcp.runtime import camera_manager, server, should_redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Read-only tools
@@ -153,7 +155,10 @@ async def protect_get_camera_streams(
     logger.info("protect_get_camera_streams tool called for %s", camera_id)
     try:
         streams = await camera_manager.get_camera_streams(camera_id)
-        return {"success": True, "data": streams}
+        return redact_sensitive_fields(
+            {"success": True, "data": streams},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
