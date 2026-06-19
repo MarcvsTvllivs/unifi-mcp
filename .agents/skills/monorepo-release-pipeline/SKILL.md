@@ -99,6 +99,8 @@ can lag or overstate changes.
 | Plugin-only changes (manifest/config updates) | Patch release for cache invalidation (e.g., `network/v0.14.13` → `network/v0.14.14`) |
 | Worker (`apps/worker/`) | `worker/v*` |
 
+**Negative corollary (skip-unchanged rule):** Do NOT tag a package simply because an upstream dependency was bumped, if the package's own code did not change AND its existing `pyproject.toml` bounds already accommodate the new upstream version. Check the declared version range in `pyproject.toml` first — if the new upstream version already satisfies the existing bounds and the app code is unchanged, no new tag is required.
+
 ### Tagging Selectivity Framework
 
 **Minimal (lowest risk):** Tag ONLY packages with code changes in their own directory.
@@ -143,7 +145,7 @@ When releasing multiple packages in one coordination, avoid bumping major versio
 
 ### Library packages (unifi-core, unifi-mcp-shared, relay, api)
 
-Use `dynamic = [\"version\"]` with hatch-vcs. Version is derived from the git tag at build time — no `_version.py` is ever committed. When a library tag is pushed, `bump-plugin-versions.yml` outputs `No version changes to commit` — this is **correct and expected**.
+Use `dynamic = ["version"]` with hatch-vcs. Version is derived from the git tag at build time — no `_version.py` is ever committed. When a library tag is pushed, `bump-plugin-versions.yml` outputs `No version changes to commit` — this is **correct and expected**.
 
 **`unifi-api-server` is a library package**, not an app package. It publishes to PyPI only and has no plugin manifest assets. Expect no writeback on `api/v*` tags.
 
@@ -190,6 +192,8 @@ Each package must declare both `tag_regex` and `git_describe_command` scoped to 
 ### Step 0: Pin-Alignment CI Gate (Automated Blocker)
 
 The pin-alignment CI gate (PR #286) runs on every PR and **cannot be skipped**. It validates that every downstream package's dependency bounds permit the versions of upstream packages on main. If your PR fails: look at the CI output for the specific package and bound that failed, update the offending bounds in `pyproject.toml`, commit and push.
+
+**CI gate gap — import-only PRs:** The pin-alignment gate fires only when `pyproject.toml` changes. A PR that adds code using a new cross-package API (new import from `unifi-core` or `unifi-mcp-shared`) without updating the floor bound in `pyproject.toml` passes CI even when the published upstream wheel's metadata would reject the resolved version at user install time. Manually verify dependency bounds for any PR that expands cross-package imports.
 
 ### Align Cross-Package Dependency Bounds Before Tagging
 
@@ -253,6 +257,8 @@ git tag relay/v0.1.0
 git push origin relay/v0.1.0
 ```
 
+> **Floor-bump sequencing gotcha:** Open downstream `pyproject.toml` floor-bump PRs (raising the minimum version bound on an upstream package) **only after** the upstream tag is confirmed on PyPI. Committing the floor-bump PR before the upstream version exists on PyPI causes the pin-alignment CI gate on that PR to fail — the gate tries to resolve the declared lower bound but the version does not yet exist.
+
 ---
 
 ## Procedure G: generate_release_notes.py Path Configuration
@@ -271,13 +277,14 @@ After pushing a tag:
 2. **Verify locally:** `cd apps/<app> && hatch version` — should print exactly the tagged version.
 3. **Confirm PyPI:** `pip index versions unifi-network-mcp`.
 4. **Install smoke test:** `pip install --upgrade unifi-network-mcp && python -c "import unifi_network_mcp; print(unifi_network_mcp.__version__)"`.
-5. **Post-Release Live Smoke Verification:**
+5. **Post-Release Live Smoke Verification** (must run via `uv`, not system `python3`):
    ```bash
-   python scripts/live_smoke.py --server network --phase safe
-   python scripts/live_smoke.py --server protect --phase safe
-   python scripts/live_smoke.py --server access --phase safe
+   uv run python scripts/live_smoke.py --server network --phase safe
+   uv run python scripts/live_smoke.py --server protect --phase safe
+   uv run python scripts/live_smoke.py --server access --phase safe
    ```
    All three must exit 0 with zero failed/exception records. This is the final release validation gate.
+   **Do not invoke with bare `python3 scripts/live_smoke.py`** — the system Python lacks the workspace dependencies and the harness will fail at import time.
 
 ---
 
@@ -294,9 +301,15 @@ cd apps/network && uv run pytest && cd ../..
 cd apps/protect && uv run pytest && cd ../..
 ```
 
+**Strategy A (Reactive):** Batch accumulated Dependabot PRs into a single maintainer branch, run `uv lock`, merge the combined PR.
+
+**Strategy B (Proactive):** Don't wait for Dependabot PRs to accumulate. Periodically run `uv lock` yourself and open a single maintainer PR before the Dependabot queue grows. This prevents cascading CI failures from multiple simultaneous lockfile-touching PRs.
+
 **Major-version bumps are invisible at the PR level** — the CI failure looks identical to a minor version conflict. Always inspect the actual version change in the PR diff.
 
 **pyproject floor vs. lockfile drift:** After batching, verify each updated package's lower bound still permits the resolved version. Run the wheel-metadata check from Procedure D before merging.
+
+**Second-wave cascading PRs gotcha:** After a batch Dependabot PR merges, Dependabot may open a fresh wave of new PRs for versions newly unlocked by the combined resolution. This is expected — the first merge freed resolution space for the next tier. Budget time for a second round of batching review.
 
 ---
 

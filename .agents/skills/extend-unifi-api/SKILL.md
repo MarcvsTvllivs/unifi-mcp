@@ -467,9 +467,13 @@ Manager methods: `list_{resource}s()`, `get_{resource}(id)`, `create_{resource}(
 
 **Tool description vs. Pydantic Field description:** Keep distinct — do not copy-paste tool description into field descriptions.
 
-**`api_request_raw` required for empty-body Protect DELETE and merge ops:** `client.api_request()` raises when the controller returns an empty response body. Use `client.api_request_raw()` instead. Reference: `packages/unifi-core/src/unifi_core/protect/managers/alarm_manager.py`.
+**`api_request_raw` required for empty-body Protect DELETE and merge ops:** `client.api_request()` raises when the controller returns an empty response body. Use `client.api_request_raw()` instead. Reference: `packages/unifi-core/src/unifi_core/protect/managers/alarm_manager.py`
 
 **`AlarmRulesFacade` — version-transparent facade for dual-backend resources:** When a resource spans two API backends, implement a facade that prefers v2 and falls back to legacy on `AlarmManagerPermissionError` or `BadRequest`. Surface the `complete` flag in `_meta`. 5xx/transient errors must NOT be masked. Reference: `packages/unifi-core/src/unifi_core/protect/managers/alarm_facade.py`.
+
+**`AlarmRulesFacade._id_family` routing — UUID format wins, legacy IDs may have suffixes:** `_id_family` routes a rule ID to v2 (if it matches full UUID format) or legacy (everything else). Do NOT use a strict 24-hex ObjectID regex for this check — legacy automation IDs may carry suffixes like `_new` which would fail a strict hex test. The module uses `_UUID_RE` (UUID format match) as the sole branch condition: `return "v2" if _UUID_RE.match(rule_id) else "legacy"`. Any refactor that replaces `_UUID_RE` with a 24-hex regex will silently misroute suffixed legacy IDs.
+
+**Preview/apply backend-selection symmetry (AlarmRulesFacade):** The preview path of any mutation tool on a dual-backend facade MUST use `_id_family` for backend selection — the same logic the apply path uses. If preview fetches the rule via the wrong backend, it may succeed (returning stale data) while apply routes differently and fails or mutates the wrong record. Test both preview and apply against a rule ID from each backend.
 
 **SuperAdmin prerequisite for OS-level Protect v2 endpoints:** Some endpoints require SuperAdmin on the Protect console. Regular site admins receive `AlarmManagerPermissionError`; `AlarmRulesFacade` falls back silently. Always document this requirement in tool descriptions.
 

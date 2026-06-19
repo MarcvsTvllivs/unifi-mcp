@@ -4,14 +4,15 @@ description: |
   Apply this skill whenever you are adding, extending, or debugging an MCP tool that
   touches a UniFi feature served by more than one API surface — specifically when a
   feature appears on both the Protect private API (/proxy/protect/api/) and the
-  UniFi OS-level v2 service (/api/v2/). This skill covers: mapping which endpoints
-  belong to which surface, implementing a version-transparent façade with automatic
-  backend selection, handling the SuperAdmin permission requirement for /api/v2/
-  endpoints, emitting _meta coverage signals when serving from a degraded backend,
-  and fixing empty-body response bugs using api_request_raw. Apply even if the user
-  doesn't explicitly ask about API versioning — any time you're touching alarm rules,
-  arm/disarm profiles, or a new Protect domain that might have both a legacy
-  /proxy/protect/api/ path and a newer /api/v2/ path.
+  UniFi OS-level v2 service (/api/v2/). Covers: surface mapping, version-transparent
+  façade with automatic backend selection, alarm rule mutation routing by ID family
+  (UUID to v2 service, Mongo ObjectID to legacy), vocabulary translation between
+  legacy (name/conditions) and v2 (title/triggers), SuperAdmin permission for /api/v2/,
+  _meta coverage signals, empty-body fixes via api_request_raw, the
+  require_non_empty_actions guard, and capture-first for unknown mutation endpoints.
+  Apply even if not explicitly asked about API versioning — any time you're touching
+  alarm rules, arm/disarm profiles, AlarmRulesFacade mutations, or any Protect domain
+  with both a /proxy/protect/api/ and /api/v2/ surface.
 managed_by: myco
 user-invocable: true
 allowed-tools: Read, Edit, Write, Bash, Grep, Glob
@@ -25,8 +26,8 @@ service at `/api/v2/`. These surfaces are independent — different auth require
 different ID schemes, different data models, and different coverage. Failing to bridge
 them correctly causes agents to see silent data gaps with no signal that anything is
 missing. This skill teaches you how to discover surface boundaries, abstract them
-behind a stable façade, handle auth and protocol quirks, and signal coverage gaps
-explicitly.
+behind a stable façade, handle auth and protocol quirks, signal coverage gaps
+explicitly, and safely implement mutations across surfaces.
 
 ## Prerequisites
 
@@ -34,8 +35,7 @@ Before working in this domain:
 
 1. **Identify all API surfaces.** Open the Protect UI in a browser, navigate to the
    feature area (e.g., Alarm Manager, arm/disarm profiles), and capture network
-   traffic. UI network calls reveal the actual endpoint paths — not the ones you'd
-   assume from existing code.
+   traffic. UI network calls reveal the actual endpoint paths.
 
 2. **Understand the three known surfaces for Alarm-related features:**
 
@@ -47,54 +47,48 @@ Before working in this domain:
    | UniFi OS v2 (profiles) | `/api/v2/alarms/profiles` | Arm/disarm profiles | **SuperAdmin** |
 
 3. **Account permissions.** The `/api/v2/*` service requires **SuperAdmin** role.
-   Elevate the service account (e.g., `homebridge`) in UniFi OS User Management
-   before testing. A 403 from `/api/v2/` means permissions, not routing — a routing
-   failure would produce a 404.
+   A 403 from `/api/v2/` means permissions, not routing — a routing failure produces a 404.
 
 4. **Routing v2 calls.** `uiprotect.api_request(api_path="/api/v2/alarms/", url="...")`
-   routes to the OS-level service through the existing client. No bespoke HTTP client
-   is needed. The `api_path` parameter controls which base the URL is relative to.
+   routes to the OS-level service through the existing client.
+
+5. **Capture before Phase 3 mutations.** v2 create/update/delete request shapes are
+   unknown until captured from a live console — do not implement against assumed shapes
+   (see Procedure I).
 
 ## Procedure A: Mapping a New Dual-Surface Feature
 
 When you encounter a Protect UI feature that doesn't match the data your code returns,
 suspect a dual-surface gap.
 
-1. **Live comparison test.** Fetch from both surfaces for the same feature type and
-   compare record counts and ID formats:
-   - Protect private path (e.g., `/proxy/protect/api/automations`) — count records
-   - UniFi OS path (e.g., `/api/v2/alarms/protect`) — count records
-   - If v2 count > legacy count: v2 has additional data types the legacy API cannot
-     represent (e.g., AI natural-language alarms)
+1. **Live comparison test.** Fetch from both surfaces and compare record counts and ID
+   formats. If v2 count > legacy count, v2 has additional data types the legacy API
+   cannot represent (e.g., AI natural-language alarms).
 
-2. **Check ID schemes.** If legacy returns Mongo ObjectIDs (24-char hex) and v2
-   returns UUIDs (8-4-4-4-12), they are different representations of the same
-   underlying data — not duplicate services. Document this in the discovery spore.
+2. **Check ID schemes.** Legacy returns Mongo ObjectIDs (24-char hex); v2 returns
+   UUIDs (8-4-4-4-12). These are different representations — not duplicates.
 
-3. **Determine subset relationship.** For alarm rules: legacy is a strict subset of
-   v2 (52/52 legacy rules appear in v2, plus AI-NL alarms exclusive to v2). Document
-   the relationship explicitly — it determines which surface should be preferred and
-   which is the safe fallback.
+3. **Determine subset relationship.** For alarm rules: legacy is a strict subset of v2
+   (52/52 legacy rules appear in v2, plus AI-NL alarms exclusive to v2). Document the
+   relationship — it determines which surface should be preferred and which is the
+   fallback.
 
 4. **Flag silent gaps.** If the existing tool returns from legacy only and v2 has
-   records that legacy cannot represent, this is a correctness issue: agents see a
-   partial picture with no signal that anything is missing. Before PR #320,
-   `protect_alarm_list_rules` silently omitted all AI-NL alarms.
+   records legacy cannot represent, agents see a partial picture with no signal.
+   Before PR #320, `protect_alarm_list_rules` silently omitted all AI-NL alarms.
 
 ## Procedure B: Implementing a Version-Transparent Façade
 
 When a feature lives on multiple incompatible API surfaces, the tool name must describe
 capability, not implementation. Abstract the version in the backend, not the tool name.
 
-**Do NOT** create `protect_alarm_v2_list_rules` alongside `protect_alarm_list_rules`.
-This forces agents to reason about API versions (a maintainer concern), and creates
-parallel tool families that must be kept in sync forever.
+**Do NOT** create `protect_alarm_v2_list_rules` alongside `protect_alarm_list_rules` —
+this forces agents to reason about API versions and creates parallel tool families.
 
 **Do** create a façade class with automatic backend selection. The real implementation
 is in `packages/unifi-core/src/unifi_core/protect/managers/alarm_facade.py`:
 
 ```python
-# alarm_facade.py — simplified structure (see AlarmRulesFacade in the actual file)
 class AlarmRulesFacade:
     def __init__(self, service_manager: AlarmManagerService, legacy_manager: AlarmManager):
         self._service = service_manager    # /api/v2/alarms/ via AlarmManagerService
@@ -109,39 +103,26 @@ class AlarmRulesFacade:
             return rules, True          # v2 backend: complete coverage
         raw = await self._legacy.list_rules()
         return [alarm_rule_from_legacy(r).model_dump(exclude_none=True) for r in raw], False
-        # False signals fallback; tool layer emits _meta coverage key
 ```
 
-**Canonical model.** The v2 `AlarmRule` model lives in
-`packages/unifi-core/src/unifi_core/protect/models/alarm_rules.py`. Key fields:
+> **"200 OK + empty list" must also trigger fallback (PR #334):** `if rules:` evaluates
+> False for both `None` (error case) and `[]` (unmigrated console). Three-state coverage:
+> - SuperAdmin + migrated console: v2 returns rules → serve v2 (`complete=True`)
+> - SuperAdmin + unmigrated console: v2 returns `200 []` → fall back to legacy
+> - Non-SuperAdmin: v2 returns `403` → fall back to legacy
 
-```python
-class AlarmRule(BaseModel):
-    id: Optional[str] = Field(...)         # UUID (v2) or ObjectID (legacy)
-    title: Optional[str] = Field(...)      # Rule display name
-    enabled: Optional[bool] = Field(...)   # v2 only; absent in legacy via exclude_none
-    triggers: list[AlarmTrigger] = ...     # v2 trigger model
-    actions: list[AlarmAction] = ...
-    scope: dict[str, Any] = ...
-```
+**Canonical model** lives in
+`packages/unifi-core/src/unifi_core/protect/models/alarm_rules.py`. Use
+`model.model_dump(exclude_none=True)` when serializing legacy-sourced records so
+callers see a stable field contract regardless of backend.
 
-Use `model.model_dump(exclude_none=True)` when serializing legacy-sourced records so
-callers see a stable field contract regardless of which backend served the data.
+**Internal naming discipline.** Remove `v2` from all internal identifiers
+(`AlarmV2Manager` → `AlarmManagerService`). The literal `/api/v2/alarms/` path in
+routing code is preserved — it's a real URL, not a naming choice.
 
-**Internal naming discipline.** Remove `v2` from all internal identifiers:
-- `AlarmV2Manager` → `AlarmManagerService`
-- `alarm_rule_v2_from_controller` → `alarm_rule_from_controller`
-
-The literal `/api/v2/alarms/` path in routing code is preserved — it's a real URL,
-not a naming choice. That distinction matters: URL paths are facts; type and function
-names are choices.
-
-**TDD sequence:**
-1. Canonical model tests (field presence/absence by backend)
-2. Façade routing tests (mock both backends; assert v2 is tried first)
-3. Fallback tests (mock v2 to raise `AlarmManagerPermissionError` or `BadRequest`; assert legacy used + `_meta` emitted)
-4. Tool wiring tests (assert tool calls façade, not backend directly)
-5. Manifest regen → live smoke test with both account permission levels
+**TDD sequence:** canonical model tests → façade routing tests → fallback tests
+(mock v2 to raise `AlarmManagerPermissionError` or return `[]`) → tool wiring tests
+→ manifest regen → live smoke at both permission levels.
 
 ## Procedure C: Fixing Empty-Body Response Bugs
 
@@ -149,63 +130,34 @@ Protect mutation endpoints (DELETE, some POST) return an **empty body** on succe
 `uiprotect`'s `api_request()` unconditionally calls `response.json()`, which throws
 `Could not decode JSON` on `b""`. The operation succeeds; the error is spurious.
 
-**Symptom:** A delete or merge operation raises `Could not decode JSON` even though
-the entity is actually gone (confirmed by a subsequent fetch returning 404/NotFound).
-
-**Diagnosis.** Probe the endpoint with `api_request_raw` and print the raw response:
-
-```python
-resp = await api.api_request_raw("delete", url, raise_exception=False)
-print(f"raw_type={type(resp)}  body={resp}")
-# None or b"" confirms the empty-body pattern
-```
-
-**Fix:**
+**Fix:** Replace `api_request` with `api_request_raw` when the response body is discarded:
 
 ```python
 # Broken: empty response → JSON decode error
 await self._api.api_request("delete", url, raise_exception=True)
-
-# Fixed: returns raw bytes, handles empty body cleanly
+# Fixed: handles empty bytes cleanly
 await self._api.api_request_raw("delete", url, raise_exception=True)
 ```
-
-This switch is always safe when the caller **discards the response** — specifically
-methods that capture a pre-operation preview snapshot and return that, ignoring the
-operation's response body entirely.
 
 **Known affected methods (all fixed), in `packages/unifi-core/src/unifi_core/protect/managers/recognition_manager.py`:**
 - `apply_delete_known_face` — DELETE `/recognition/face/groups/{id}` — PR #319
 - `apply_delete_known_vehicle` — DELETE vehicle group — PR #316
 - `apply_merge_known_faces` — POST `/recognition/face/groups/merge` — PR #321
 
-**Audit rule for new endpoints.** Any new `method="delete"` or discarded-response
-POST call in a Protect manager must use `api_request_raw`. Probe before shipping.
-The empty-body bug class is fully closed for existing methods — don't reopen it.
-
-**Test pattern:** Assert `api_request_raw` is called (not `api_request`). Run the
-full protect suite (396+ tests) to confirm no regressions.
+**Audit rule:** Any new `method="delete"` or discarded-response POST in a Protect
+manager must use `api_request_raw`. Probe with `api_request_raw` first if uncertain.
 
 ## Procedure D: Emitting `_meta` Coverage Signals
 
-When a tool serves from a degraded backend (partial data), signal this explicitly in
-the response rather than silently omitting records.
-
-**Convention.** Use the project's `com.github.sirkirby.unifi-mcp/` reverse-DNS
-namespace for `_meta` keys. The alarm coverage constant, defined in
-`apps/protect/src/unifi_protect_mcp/tools/alarm.py`:
+When a tool serves from a degraded backend, signal this explicitly rather than silently
+omitting records. Use the project's `com.github.sirkirby.unifi-mcp/` reverse-DNS
+namespace. Constants defined in `apps/protect/src/unifi_protect_mcp/tools/alarm.py`:
 
 ```python
 _ALARM_COVERAGE_META = "com.github.sirkirby.unifi-mcp/alarm-coverage"
-_ALARM_COVERAGE_NOTICE = (
-    "Showing legacy Protect automations: the UniFi-OS Alarm Manager (/api/v2/alarms) "
-    "returned no rules or is unavailable on this console, so AI-powered alarms "
-    "(where supported) are not included."
-)
 ```
 
-**Where to emit.** In the tool layer's helper function, merge `_meta` into the
-serialized response when the façade signals incomplete coverage (`complete=False`):
+Merge `_meta` into the serialized response when `complete=False` from the façade:
 
 ```python
 def _with_alarm_coverage_meta(result: dict, complete: bool) -> dict:
@@ -214,69 +166,158 @@ def _with_alarm_coverage_meta(result: dict, complete: bool) -> dict:
     return result
 ```
 
-Call this wrapper on every tool that returns alarm rule data:
-
-```python
-return _with_alarm_coverage_meta({"success": True, "data": {"rules": rules, "count": len(rules)}}, complete)
-```
-
-**What `_meta` communicates to agents:**
-- Key `com.github.sirkirby.unifi-mcp/alarm-coverage` → `{"complete": False, "reason": <human-readable notice>}`
-- Absence of `_meta` → v2 backend used; full coverage assumed (do not emit `_meta` for v2 responses)
-
-**When NOT to emit `_meta`.** SuperAdmin v2 responses omit `_meta` entirely.
-Only emit it when coverage is genuinely incomplete. Never fabricate a `_meta` key
-to explain a legitimate error — that's a different code path.
+SuperAdmin v2 responses omit `_meta` entirely. Only emit when coverage is genuinely
+incomplete.
 
 ## Procedure E: SuperAdmin Elevation and Graceful Degradation
-
-The `/api/v2/` service permission boundary is a security constraint, not a bug.
 
 **Elevation steps:**
 1. Log in to UniFi OS console as an account with existing SuperAdmin access
 2. Navigate to Users → find the MCP service account (e.g., `homebridge`)
-3. Change role to **SuperAdmin**
-4. Log out and back in with the service account to mint a fresh session token
-5. Re-test: `GET /api/v2/alarms/profiles` should now return 200
+3. Change role to **SuperAdmin**; log out and back in to mint a fresh session token
+4. Re-test: `GET /api/v2/alarms/profiles` should now return 200
 
-**Security implication — document clearly:** SuperAdmin has full blast-radius across
-the UniFi OS console, not just Protect. Recommendation: use a dedicated SuperAdmin
-service account for alarm-v2 operations rather than reusing the general homebridge
-credential. Never silently assume the operator understands this.
+**Security implication:** SuperAdmin has full blast-radius across the entire UniFi OS
+console. Use a dedicated SuperAdmin service account for alarm-v2 operations.
 
 **Graceful degradation is non-negotiable.** The façade's `AlarmManagerPermissionError`
-and `BadRequest` catch ensures the MCP server remains fully functional with legacy
-alarm coverage even without SuperAdmin. Never make SuperAdmin a hard requirement —
-make it the path to full coverage, with the `_meta` signal marking the difference.
+and `BadRequest` catch ensures the MCP server remains fully functional with legacy alarm
+coverage even without SuperAdmin. Never make SuperAdmin a hard requirement.
 
-**Distinguishing 403 from 404:**
-- `403 Forbidden` from `/api/v2/` → permission boundary (account needs elevation)
-- `404 Not Found` → routing failure (wrong path or service unavailable)
-- Do not mistake a 403 for a routing or header problem — confirm account role before
-  investigating headers.
+**Distinguishing 403 from 404:** `403` = permission boundary (account needs elevation);
+`404` = routing failure (wrong path or service unavailable).
+
+## Procedure F: Mutation Routing by ID Family
+
+All CRUD mutations flow through `AlarmRulesFacade`. Routing is deterministic at call
+time based on the ID format the agent passes back from a prior `list`/`get`.
+
+| ID format | Example | Backend |
+|---|---|---|
+| UUID (36-char) | `019e89f0-8fc0-7141-9a64-7eb3f5746148` | v2 UniFi OS service (`/api/v2/alarms/`) |
+| 24-hex Mongo ObjectID | `674f3052cdbf2c191e0a01b7` | Legacy Protect automations |
+
+**Implementation** in `packages/unifi-core/src/unifi_core/protect/managers/alarm_facade.py`
+(PR #366 — `_OBJECT_ID_RE` removed; UUID detection is now the sole routing criterion):
+
+```python
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+@staticmethod
+def _id_family(rule_id: str) -> str:
+    """Route by id: v2 UUIDs go to the Alarm Manager, everything else to legacy."""
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise ValueError("Alarm rule id must be a non-empty string")
+    return "v2" if _UUID_RE.match(rule_id) else "legacy"
+```
+
+An agent cannot invent an ID — it received it from a prior tool call, so the ID encodes
+which backend owns it. No read-before-write probe needed for update or delete.
+
+**Create** requires an explicit read probe: check v2 reachability via the same selection
+logic as `list_rules`; if SuperAdmin + v2 available → create via v2, else → legacy.
+
+**Triage tell:** `UniFiNotFoundError` on mutation + `complete=True` on list = a v2 UUID
+was passed to the legacy backend — facade mutation routing is not wired correctly.
+
+## Procedure G: Write Schema Vocabulary Translation
+
+The v2 and legacy backends use **fundamentally different field names** for mutations.
+`rule_to_controller` (alarms.py:481) only performs snake→camel renames within the
+legacy vocabulary — it is **NOT** a cross-backend serializer.
+
+| Concept | Legacy field | v2 field |
+|---|---|---|
+| Rule name | `name` | `title` |
+| Enabled flag | `enable` | `enabled` |
+| Trigger events | `conditions` | `triggers` |
+| Source list | `sources` | nested inside `scope` |
+
+**Fix:** Implement a dedicated `alarm_rule_to_legacy_body` (genuine inverse of
+`alarm_rule_from_legacy`) in `packages/unifi-core/src/unifi_core/protect/models/alarm_rules.py`.
+Use canonical write shape (`title`/`enabled`/`triggers`) at the facade surface, then
+translate per backend path.
+
+**Echo `data` verbatim** in the inverse — `alarm_rule_from_legacy` stores entire legacy
+dicts in `data`; the inverse must echo them, not reconstruct nested structures.
+
+**Fetch-merge-PUT pattern for updates:** Fetch raw body from owning backend → merge
+caller's changes → PUT merged body back. The facade owns this operation entirely.
+
+> **Gotcha:** Hand-crafted test fixtures can accidentally round-trip because they lack
+> the nested legacy structure. Only real captured fixtures catch structural mismatches.
+
+## Procedure H: require_non_empty_actions Mutation Guard
+
+**Live-tested gotcha (2026-05-27):** Creating an alarm rule with an empty `actions`
+list via the API **breaks the Protect UI** — the UI becomes non-functional and the
+corrupted rule can only be deleted via the API.
+
+`require_non_empty_actions` is defined in
+`packages/unifi-core/src/unifi_core/protect/models/_validators.py` and applied in
+`packages/unifi-core/src/unifi_core/protect/managers/alarm_facade.py`. Apply in the
+facade before any create or actions-touching update.
+
+| Operation | Apply guard? |
+|---|---|
+| Create | Always |
+| Update (partial, `actions` in change set) | Yes |
+| Update (partial, `actions` NOT in change set) | No |
+
+When refactoring input models, explicitly verify the guard is still applied — it must
+travel with the facade's canonical path, not with any specific input model class.
+
+## Procedure I: Phase-Based Delivery and Capture-First Discipline
+
+**Deliver read-only capabilities before mutations.** Read paths have fewer safety
+invariants and provide the live surface knowledge needed to implement mutations safely.
+
+**Capture-first for unknown mutation endpoints:**
+1. Do NOT implement against assumed shapes — fabricated fixture tests mask bugs
+2. Open a capture session against a real console, record the raw HTTP exchange
+3. Build the serializer and unit tests from the **real** captured fixture
+4. Only then implement the mutation method
+
+**Phased delivery checklist:**
+1. ✅ Map both surfaces (paths, auth, ID formats, data overlap)
+2. ✅ Implement facade with read operations and backend selection logic
+3. ✅ Add `_meta` coverage signal for legacy fallback
+4. ✅ Verify fallback triggers on both `403` **and** `200 []` cases
+5. ✅ Capture raw HTTP exchange for all mutation endpoints before implementing
+6. ✅ Implement write schema translators tested against real captured fixtures
+7. ✅ Add `require_non_empty_actions` guard in facade before routing
+8. ✅ Extend facade to own all mutations: update/delete by ID family; create by read probe
 
 ## Cross-Cutting Gotchas
 
-**Silent gaps are worse than explicit errors.** An agent listing alarm rules from
-the legacy backend and receiving 52 results has no idea it's missing AI-NL alarms.
-Always emit `_meta` when coverage is partial — never let incomplete results look
-complete.
+**Silent gaps are worse than explicit errors.** Always emit `_meta` when coverage is
+partial — never let incomplete results look complete.
 
-**Never let v2 appear in tool names or user-visible identifiers.** The moment you
-expose `_v2_` in a tool name, every future API version forces a new tool family. The
-façade pattern exists precisely to prevent this. Internal code may reference v2 paths
-(they're URLs — facts), but the public MCP tool surface must be version-agnostic.
+**Never let v2 appear in tool names.** The façade pattern exists to prevent version
+leakage into the MCP tool surface. Internal code may reference v2 paths (they're URLs);
+public MCP tool names must be version-agnostic.
 
-**Test both permission levels explicitly.** The façade's fallback path is only
-exercised when SuperAdmin is absent. In CI, mock `AlarmManagerPermissionError` or
-`BadRequest` for fallback tests — don't assume real credentials will always be
-SuperAdmin.
+**Test both permission levels explicitly.** The façade's fallback path is only exercised
+when SuperAdmin is absent. In CI, mock `AlarmManagerPermissionError` or `BadRequest`.
 
 **Apply `api_request_raw` proactively.** Before shipping any new DELETE or
-discarded-response POST endpoint in a Protect manager, check whether the controller
-returns an empty body on success. Probe with `api_request_raw` first if uncertain.
+discarded-response POST endpoint in a Protect manager, probe with `api_request_raw`.
 
-**Future surface candidates.** Arm/disarm profiles (`/api/v2/alarms/profiles`) are
-the next candidate for dual-surface exposure if a legacy Protect path is ever added.
-The same façade pattern applies: map the surfaces, determine subset relationship,
-implement version-transparent backend selection with graceful degradation.
+**ID spaces are non-overlapping.** Feeding a v2 UUID to the legacy backend returns
+`UniFiNotFoundError` with no useful diagnostic. The facade must route; callers must
+never bypass it.
+
+**`rule_to_controller` is NOT a cross-backend serializer.** It emits
+`name`/`conditions` (legacy vocabulary). Using it on the v2 serialization path silently
+sends malformed bodies.
+
+**Test serializers against real captured fixtures, not hand-crafted inputs.** Only real
+fixture data catches structural mismatches in the legacy serializer inverse.
+
+**Fallback must handle both 403 and 200 [].** A 200-empty response from an unmigrated
+service looks like success — it is not.
+
+**Future surface candidates.** Arm/disarm profiles (`/api/v2/alarms/profiles`) follow
+the same dual-surface pattern if a legacy Protect path is ever added.
