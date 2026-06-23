@@ -138,6 +138,13 @@ lint failures. The project uses Ruff as the canonical linter; violations are har
 If the PR introduces lint errors, request fixes via fork-edit (trusted contributors) or a
 review comment (first-time contributors).
 
+**Cross-package import check:** When a PR adds a new cross-package import (e.g., `unifi-network`
+importing from `unifi-core`), verify the dependency is declared in `pyproject.toml`. PRs that add
+cross-package imports without updating `pyproject.toml` silently skip the `check-pin-alignment` CI
+gate, which enforces version floor consistency across packages. If the import is new and no
+`pyproject.toml` change is present, flag it as a potential blocker and request an explicit floor
+bump to the imported package's minimum version.
+
 #### 1B: F-String Logger — Hard Blocker
 
 **Primary target:** Every `*_manager.py` file the PR touches.
@@ -651,6 +658,16 @@ a bug report, treat that proposal as a starting hypothesis — not a confirmed d
 showed this pattern: initial AI analysis proposed a code change without confirmed reproduction; the
 developer correctly pushed back. Always verify with live reproduction before merging any AI-proposed fix.
 
+**Gotcha: Community-submitted AI-traced root-cause diagnoses require independent source verification** —
+When a contributor submits a detailed AI-assisted root-cause trace (e.g., "the bug is in function X
+at line Y, which does Z"), treat it as a starting hypothesis, not a confirmed diagnosis. The contributor
+may be working from a stale branch or an AI hallucination. Before accepting the diagnosis:
+1. Fetch the HEAD source and locate the cited function(s) in the current codebase.
+2. Confirm the described behavior actually exists in the current code.
+3. Require the contributor to rebase their branch to HEAD before proceeding — their cited line numbers
+   may have shifted and their fix may have merge conflicts that invalidate the analysis.
+Only after all three checks pass should you treat the AI-traced diagnosis as actionable.
+
 ---
 
 ## Quick Reference — Gate Summary
@@ -661,6 +678,7 @@ developer correctly pushed back. Always verify with live reproduction before mer
 | PR type (Gate 0) | Routing gate | PR description + linked issue | Applying feature-addition checklist to a governance/refactor PR |
 | Design fit (Gate 0) | Feature PR primary | Scope, duplication, project intent | Mechanical gates pass but tool is out of scope |
 | Ruff lint (Gate 1A) | Hard block | Output of `make lint` | Lint violations not run or not fixed |
+| Cross-package imports (Gate 1A) | Potential block | PR diff + pyproject.toml | New import without floor bump skips check-pin-alignment CI |
 | F-string loggers (Gate 1B) | Hard block | `*_manager.py` | Manager layer even when tool layer is clean; full-payload calls promoted to INFO |
 | No-issue-refs in test strings (Gate 1B) | Hard block | Test docstrings and comment strings in PR diff | `#NNN` literals in pytest docstrings/parameterize IDs invisible to logger scanner |
 | Pydantic model wiring (Gate 2) | Critical (silent) | `unifi-core/models/<domain>.py` + tool `to_controller_update` call | Domain model exists but tool bypasses it with raw dict |
@@ -679,3 +697,4 @@ developer correctly pushed back. Always verify with live reproduction before mer
 | Mutation cycles (Step 1.5) | Field preservation blocker | Create → update → verify → delete cycle | Update tools that reconstruct objects silently zero fields |
 | Cross-platform PRs (Step 1.5) | Validation requirement | Plugin bundle .ps1, stdio auth probe, prereq scripts | Approving Windows-targeting PRs without macOS cross-platform checks |
 | Issue triage (Triage section) | Evidence gate | Raw API payload from reporter | Implementing fixes without confirmed reproduction or raw payload inspection |
+| AI-traced diagnosis (Triage section) | Evidence gate | HEAD source + function verification + rebase check | Accepting community AI-traced root-cause without verifying current codebase state |

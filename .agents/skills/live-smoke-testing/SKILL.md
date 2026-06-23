@@ -68,6 +68,14 @@ Before any live run, ensure:
    ```
    Omitting this causes silent credential-not-found failures with no warning.
 
+6. **Use `uv run`, not system python3** — the repo's dependencies are managed by uv and are
+   not installed in the system Python environment. Always invoke the harness via:
+   ```bash
+   uv run python scripts/live_smoke.py --server network --phase safe
+   ```
+   Running with bare `python3` will fail with import errors for `aiounifi`, `dotenv`, and
+   other dependencies not available outside the uv-managed virtual environment.
+
 ## Procedure 0: PRE-MERGE BLOCKING GATE — API Response Parsing Changes
 
 **Trigger Criteria — Live Smoke is Mandatory Before Merge:**
@@ -101,8 +109,8 @@ the tools that invoke the changed code and name them explicitly in the PR smoke 
 
 ```bash
 # For the affected domain(s) (e.g., network, protect, access):
-python scripts/live_smoke.py --server <domain> --phase readonly
-python scripts/live_smoke.py --server <domain> --phase safe
+uv run python scripts/live_smoke.py --server <domain> --phase readonly
+uv run python scripts/live_smoke.py --server <domain> --phase safe
 # Both must exit status 0 with no failed/exception records in artifacts
 ```
 
@@ -143,22 +151,22 @@ phases. Always start at the safest phase and advance only after the prior phase 
 
 ```bash
 # Safest run — readonly + preview + safe lifecycles (default phase is "safe")
-python scripts/live_smoke.py --server network --phase safe
+uv run python scripts/live_smoke.py --server network --phase safe
 
 # Read-only tools only (narrowest scope)
-python scripts/live_smoke.py --server network --phase readonly
+uv run python scripts/live_smoke.py --server network --phase readonly
 
 # Preview phase — all mutating tools called with confirm=False
-python scripts/live_smoke.py --server protect --phase preview
+uv run python scripts/live_smoke.py --server protect --phase preview
 
 # Approved operations — runs all safe lifecycles plus explicitly approved mutations
-python scripts/live_smoke.py --server network --phase approved
+uv run python scripts/live_smoke.py --server network --phase approved
 
 # Run all servers at once (requires full .env with Access and Protect creds)
-python scripts/live_smoke.py --server all --phase safe
+uv run python scripts/live_smoke.py --server all --phase safe
 
 # Inventory — prints safety_tier classification for every tool; no live calls
-python scripts/live_smoke.py --server network --phase inventory
+uv run python scripts/live_smoke.py --server network --phase inventory
 ```
 
 **Phase progression guidance:**
@@ -189,7 +197,7 @@ per-server artifact file in `live-smoke-results/`.
 
 ```bash
 # After reviewing Stage 1 preview output, if all looks correct:
-python scripts/live_smoke.py --server network --phase approved
+uv run python scripts/live_smoke.py --server network --phase approved
 ```
 
 The `approved` phase runs explicitly coded lifecycle methods (e.g.,
@@ -277,7 +285,7 @@ the harness as follows:
 
 1. **Run inventory to see current classification:**
    ```bash
-   python scripts/live_smoke.py --server network --phase inventory | grep unifi_new_thing
+   uv run python scripts/live_smoke.py --server network --phase inventory | grep unifi_new_thing
    ```
    Confirm `safety_tier` matches your intent. Classification is driven automatically by
    manifest annotations — check the tool's `ToolAnnotations` in the tool module.
@@ -291,13 +299,23 @@ the harness as follows:
    add a new lifecycle method to the `LiveSmokeRunner` class in `scripts/live_smoke.py` and
    call it from `run_lifecycles()` or `run_approved()`.
 
+   **Lifecycle completeness checklist — required for every new lifecycle method:**
+   - [ ] Follows create → update → get → delete order (NOT create → delete only)
+   - [ ] The update step asserts field preservation via a subsequent `get` call
+   - [ ] Non-default fields are tested with explicit targeted values (not just defaults)
+   - [ ] The lifecycle method lands in the harness permanently, not a throwaway script
+
+   The DNS lifecycle (`lifecycle_network_dns`) is the canonical reference implementation:
+   create a record, update one field, get it back to assert the update landed, then delete.
+   WLAN and AP-group lifecycles were extended to follow the same pattern (PR #372).
+
 4. **If the tool is risky/destructive:** Add it to `RISKY_OPERATION_NAMES` (the set at
    line ~90 in `scripts/live_smoke.py`) or set `destructiveHint=True` on `ToolAnnotations`.
    This moves it to `pending_approval` and excludes it from automated phases.
 
 5. **Run read-only phase first, inspect the artifact:**
    ```bash
-   python scripts/live_smoke.py --server network --phase readonly
+   uv run python scripts/live_smoke.py --server network --phase readonly
    cat live-smoke-results/network-*.json | python -m json.tool | grep -A5 unifi_new_thing
    ```
    Confirm `status: "ok"` and `success: true` and that `summary` has the expected shape.
