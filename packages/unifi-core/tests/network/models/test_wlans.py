@@ -167,3 +167,20 @@ class TestToControllerUpdate:
     def test_toggle_payload(self) -> None:
         result = to_controller_update({"enabled": False})
         assert result == {"enabled": False}
+
+    def test_networkconf_id_alias_maps_to_networkconf_id(self) -> None:
+        """Callers may pass the controller field name networkconf_id directly."""
+        result = to_controller_update({"networkconf_id": "net-3"})
+        assert result.get("networkconf_id") == "net-3"
+        assert "network_id" not in result
+
+    def test_networkconf_id_alias_combined_with_other_fields(self) -> None:
+        result = to_controller_update({"networkconf_id": "net-3", "enabled": True})
+        assert result.get("networkconf_id") == "net-3"
+        assert result.get("enabled") is True
+
+    def test_network_id_takes_precedence_when_both_passed(self) -> None:
+        """Explicit model field name wins over the controller alias regardless of insertion order."""
+        result = to_controller_update({"networkconf_id": "alias", "network_id": "explicit"})
+        assert result.get("networkconf_id") == "explicit"
+        assert "network_id" not in result

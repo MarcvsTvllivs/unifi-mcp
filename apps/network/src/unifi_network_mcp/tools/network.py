@@ -1193,6 +1193,11 @@ async def create_wlan(
     from unifi_core.network.models.wlans import Wlan as WlanModel
 
     try:
+        # Accept networkconf_id as an alias for network_id (controller name vs model name).
+        # Only remap when network_id is not already present — mirrors to_controller_update behaviour.
+        if "networkconf_id" in wlan_data and "network_id" not in wlan_data:
+            wlan_data = {**wlan_data, "network_id": wlan_data["networkconf_id"]}
+            wlan_data = {k: v for k, v in wlan_data.items() if k != "networkconf_id"}
         wlan_model = WlanModel(**{k: v for k, v in wlan_data.items() if k in WLAN_MUTABLE_FIELDS})
     except Exception as exc:
         return {"success": False, "error": f"Invalid WLAN data: {exc}"}
